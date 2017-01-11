@@ -1,0 +1,138 @@
+---
+# this brings up machines and provision them with docker installs.
+
+- hosts: localhost
+  connection: local
+
+  tasks:
+  - name: initial security group
+    ec2_group:
+      region: "{{ region | default('us-east-1') }}"
+      vpc_id: "{{ vpc_id | default('vpc-1234abcd') }}"
+      name: "{{ security_group_name | default('ansible-init-sg') }}"
+      description: Initally my IP only SSH connection
+      purge_rules: false
+      purge_rules_egress: true
+      rules:
+        - proto: tcp
+          from_port: 22
+          to_port: 22
+          #cidr_ip: "{{ ansible_default_ipv4.address }}/32"
+          cidr_ip: "0.0.0.0/0"
+      rules_egress:
+        - proto: tcp
+          from_port: 80
+          to_port: 80
+          cidr_ip: 0.0.0.0/0
+        - proto: tcp
+          from_port: 443
+          to_port: 443
+          cidr_ip: 0.0.0.0/0
+    register: security_group
+  - name: set security_group_id
+    set_fact:
+      security_group_id: "{{ security_group.group_id }}"
+
+  - name: get real user name
+    command: logname
+    register: logname
+  - name: set realuser
+    set_fact:
+      realuser: "{{ logname.stdout }}"
+
+  - name: Launch new instance
+    ec2:
+      region: "{{ region | default('us-east-1') }}"
+      vpc_subnet_id: "{{ vpc_subnet_id | default('subnet-abcd1234') }}"
+      assign_public_ip: "{{ assign_public_ip | default('yes') }}"
+      keypair: "{{ keypair | default('ansible-docker-host')  }}"
+      group_id: "{{ security_group_id }}"
+      image: "{{ ima | default('ami-9be6f38c') }}"
+      instance_type: "{{ instance_type | default('t2.micro') }}"
+      count: "{{ count | default(1) }}"
+      instance_tags:
+        Name: "aha-amdin-docker-init-{{ realuser }}"
+        Owner: admin
+        LaunchedBy: "{{ realuser }}"
+      volumes:
+        - device_name: /dev/xvda
+          volume_type: "{{ root_volume_type | default('gp2') }}"
+          volume_size: "{{ root_volume_size | default(8) }}"
+          delete_on_termination: true
+        - device_name: /dev/xvdz
+          volume_type: "{{ docker_volume_type | default('gp2') }}"
+          volume_size: "{{ docker_storage_size | default(20) }}"
+          delete_on_termination: true
+      wait: yes
+    register: ec2
+
+  - name: Add new instances to host group (in-memory inventory)
+    add_host:
+      name: "{{ item.public_ip }}"
+      groups: "dockerhosts"
+      ec2_id: "{{ item.id }}"
+    with_items: "{{ ec2.instances }}"
+
+  - name: Wait for instance to boot
+    wait_for:
+      host: "{{ item.public_ip }}"
+      port: 22
+      delay: 30
+      timeout: 300
+      state: started
+    with_items: "{{ ec2.instances }}"
+
+- hosts: "dockerhosts"
+  become: true
+
+  tasks:
+  - name: yum update 
+    yum:
+     name: '*'
+     state: latest
+  - name: yum update and Install python setuptools and docker
+    yum:
+      name: "{{ item }}"
+      update_cache: yes
+    with_items:
+      - python-setuptools
+      - docker
+  
+  - name: Create the volume group for docker volume
+    shell: vgcreate docker_vol /dev/xvdz
+  
+  - name: Install docker-storage-setup
+    yum: name=docker-storage-setup.noarch
+  
+  - name: Configure docker-storage-setup
+    lineinfile:
+      dest: /etc/sysconfig/docker-storage-setup
+      state: present
+      create: yes
+      line: "{{ item }}"
+    with_items:
+      - 'VG=docker_vol'
+      - 'DEV=/dev/xvdz'
+  
+  - name: Remove the old thin pool logical volume
+    file:
+      path: /var/lib/docker
+      state: absent
+  
+  - name: Run docker-storage-setup
+    shell: docker-storage-setup
+  
+  - name: Start docker
+    service:
+      name: docker
+      state: running
+  
+  - name: Install pypi
+    easy_install: name=pip
+  
+  - name: Install docker-py to latest
+    pip:
+      name: "{{ item }}"
+      state: latest
+    with_items:
+      - docker-py
